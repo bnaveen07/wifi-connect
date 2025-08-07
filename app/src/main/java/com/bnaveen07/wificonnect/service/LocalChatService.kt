@@ -20,457 +20,708 @@ class LocalChatService(private val context: Context) {
     private val tag = "LocalChatService"
     private val discoveryPort = 8888
     private val chatPort = 8889
-    
+    private val heartbeatPort = 8890
+    private val appSignature = "WiFiConnect_v1.0"
+
     private var serverSocket: ServerSocket? = null
     private var discoverySocket: DatagramSocket? = null
+    private var heartbeatSocket: DatagramSocket? = null
     private var isRunning = false
     private var serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
+    private var lastNetworkScan = 0L
+    private val networkScanInterval = 30000L // 30 seconds
+
     private val _chatState = MutableStateFlow(ChatState())
     val chatState: StateFlow<ChatState> = _chatState.asStateFlow()
-    
+
+    // Enhanced state management for better syncing
+    private val _discoveryState = MutableStateFlow(DiscoveryState())
+    val discoveryState: StateFlow<DiscoveryState> = _discoveryState.asStateFlow()
+
     private val connectedClients = ConcurrentHashMap<String, Socket>()
     private val discoveredUsers = ConcurrentHashMap<String, ChatUser>()
     private val privateMessageHistory = ConcurrentHashMap<String, MutableList<ChatMessage>>()
+    private val userLastSeen = ConcurrentHashMap<String, Long>()
+    private val userDeviceInfo = ConcurrentHashMap<String, DeviceInfo>()
+    private val unreadMessageCounts = ConcurrentHashMap<String, Int>()
     private val sessionToken = ChatEncryption.generateSessionToken()
     private val dataManager = ChatDataManager(context)
-    
+
     init {
-        // Generate encryption keys
-        ChatEncryption.generateKeyPair()
-        
-        // Load saved data
-        loadSavedChatData()
+        loadChatData()
     }
-    
-    fun getSavedUserName(): String {
-        return dataManager.getMyName()
-    }
-    
-    fun hasSavedUserName(): Boolean {
-        return getSavedUserName().isNotEmpty()
-    }
-    
-    fun startChatService(userName: String) {
-        if (isRunning) {
-            Log.w(tag, "Chat service already running")
-            return
-        }
-        
+
+    fun start() {
+        if (isRunning) return
+
         serviceScope.launch {
             try {
-                Log.d(tag, "Starting chat service for user: $userName")
+                if (!currentCoroutineContext().isActive) return@launch
+
                 isRunning = true
-                
-                // Save the user name for future use
-                dataManager.saveMyName(userName)
-                
-                _chatState.value = _chatState.value.copy(
+                Log.d(tag, "Starting LocalChatService")
+                _chatState.value = ChatState(
                     isEnabled = true,
-                    myName = userName,
-                    connectionStatus = ChatConnectionStatus.CONNECTING
+                    isServiceRunning = true,
+                    connectionStatus = ChatConnectionStatus.CONNECTING,
+                    myIpAddress = getMyIpAddress(),
+                    myName = _chatState.value.myName.ifEmpty { "User_${getMyIpAddress().substringAfterLast(".")}" }
                 )
+
+                // Start all components concurrently
+                launch { startDiscoveryListener() }
+                launch { startChatServer() }
+                launch { startHeartbeatSender() }
+                launch { startDiscoveryBroadcast() }
                 
-                // Get IP address first
-                val myIp = getLocalIpAddress()
-                Log.d(tag, "Local IP address: $myIp")
-                
-                if (myIp == "127.0.0.1") {
-                    Log.e(tag, "Could not get valid WiFi IP address")
-                    _chatState.value = _chatState.value.copy(
-                        connectionStatus = ChatConnectionStatus.ERROR
-                    )
-                    return@launch
-                }
-                
-                _chatState.value = _chatState.value.copy(
-                    myIpAddress = myIp
-                )
-                
-                // Start server for incoming connections
-                Log.d(tag, "Starting chat server...")
-                startChatServer()
-                
-                // Start discovery service
-                Log.d(tag, "Starting discovery service...")
-                startDiscoveryService(userName)
-                
+                // Update status to connected when all components started
                 _chatState.value = _chatState.value.copy(
                     connectionStatus = ChatConnectionStatus.CONNECTED
                 )
                 
-                Log.d(tag, "Chat service started successfully on IP: $myIp")
-                
+                Log.d(tag, "LocalChatService started successfully")
             } catch (e: Exception) {
-                Log.e(tag, "Error starting chat service", e)
-                _chatState.value = _chatState.value.copy(
-                    connectionStatus = ChatConnectionStatus.ERROR,
-                    isEnabled = false
-                )
+                Log.e(tag, "Error starting service", e)
                 isRunning = false
             }
         }
     }
-    
-    fun stopChatService() {
-        isRunning = false
-        
+
+    fun setUserName(name: String) {
+        _chatState.value = _chatState.value.copy(myName = name)
+    }
+
+    fun startWithUserName(userName: String) {
+        setUserName(userName)
+        start()
+    }
+
+    fun stop() {
         try {
+            if (!isRunning) return
+            
+            Log.d(tag, "Stopping LocalChatService...")
+            isRunning = false
+            _chatState.value = _chatState.value.copy(
+                isEnabled = false,
+                isServiceRunning = false,
+                connectionStatus = ChatConnectionStatus.DISCONNECTED
+            )
+            
+            // Update discovery state
+            updateDiscoveryState()
+            
+            // Close sockets and cancel jobs
             serverSocket?.close()
             discoverySocket?.close()
+            heartbeatSocket?.close()
+            
             connectedClients.values.forEach { it.close() }
             connectedClients.clear()
-            discoveredUsers.clear()
             
-            _chatState.value = ChatState()
-            
+            // Cancel the service scope and create a new one for restart
             serviceScope.cancel()
             serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
             
-            Log.d(tag, "Chat service stopped")
-            
+            Log.d(tag, "LocalChatService stopped")
         } catch (e: Exception) {
-            Log.e(tag, "Error stopping chat service", e)
+            Log.e(tag, "Error stopping service", e)
         }
     }
-    
+
+    private fun updateDiscoveryState() {
+        val currentUsers = discoveredUsers.values.map { user ->
+            val unreadCount = unreadMessageCounts[user.ipAddress] ?: 0
+            user.copy(unreadCount = unreadCount)
+        }
+        _discoveryState.value = _discoveryState.value.copy(
+            discoveredUsers = currentUsers
+        )
+    }
+
+    private fun loadChatData() {
+        serviceScope.launch {
+            try {
+                val unreadCounts = unreadMessageCounts
+                
+                val (groupMessages, privateMessages) = dataManager.getAllMessages()
+                privateMessageHistory.clear()
+                privateMessageHistory.putAll(privateMessages.mapValues { it.value.toMutableList() })
+                
+                val updatedUsers = discoveredUsers.values.map { user ->
+                    val unreadCount = unreadCounts[user.ipAddress] ?: 0
+                    user.copy(unreadCount = unreadCount)
+                }
+                
+                // Update unread counts for each user
+                privateMessageHistory.forEach { (userIp, messages) ->
+                    unreadMessageCounts[userIp] = messages.count { !it.isFromMe && !it.isRead }
+                }
+                
+                // Update state
+                dataManager.saveGroupMessages(groupMessages)
+                
+                _chatState.value = _chatState.value.copy(
+                    messages = groupMessages,
+                    privateMessages = privateMessageHistory.toMap()
+                )
+                
+                updateDiscoveryState()
+                
+            } catch (e: Exception) {
+                Log.e(tag, "Error loading chat data", e)
+            }
+        }
+    }
+
+    private fun getMyIpAddress(): String {
+        val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val ipAddress = wifiManager.connectionInfo.ipAddress
+        return String.format(
+            "%d.%d.%d.%d",
+            (ipAddress and 0xff),
+            (ipAddress shr 8 and 0xff),
+            (ipAddress shr 16 and 0xff),
+            (ipAddress shr 24 and 0xff)
+        )
+    }
+
+    private suspend fun startDiscoveryListener() {
+        withContext(Dispatchers.IO) {
+            try {
+                // Close existing socket if any
+                discoverySocket?.close()
+                
+                // Try to bind to the discovery port with retries
+                var attempts = 0
+                var currentPort = discoveryPort
+                var socketCreated = false
+                
+                while (attempts < 5 && !socketCreated && currentCoroutineContext().isActive) {
+                    try {
+                        discoverySocket = DatagramSocket(currentPort).apply {
+                            reuseAddress = true
+                            soTimeout = 1000 // 1 second timeout for receive operations
+                        }
+                        socketCreated = true
+                        Log.d(tag, "Discovery listener started on port $currentPort")
+                    } catch (e: java.net.BindException) {
+                        attempts++
+                        currentPort = discoveryPort + attempts
+                        Log.w(tag, "Port $currentPort in use, trying ${currentPort + 1}")
+                        if (attempts >= 5) {
+                            throw e
+                        }
+                    }
+                }
+
+                while (currentCoroutineContext().isActive && isRunning && discoverySocket != null) {
+                    val buffer = ByteArray(1024)
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    
+                    try {
+                        discoverySocket?.receive(packet)
+                        val data = String(packet.data, 0, packet.length)
+                        handleDiscoveryMessage(data, packet.address)
+                    } catch (e: SocketTimeoutException) {
+                        // Timeout is normal, continue listening
+                    } catch (e: Exception) {
+                        if (currentCoroutineContext().isActive && isRunning) {
+                            Log.e(tag, "Error in discovery listener", e)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (currentCoroutineContext().isActive && isRunning) {
+                    Log.e(tag, "Error starting discovery listener", e)
+                }
+            }
+        }
+    }
+
     private suspend fun startChatServer() {
         withContext(Dispatchers.IO) {
             try {
-                serverSocket = ServerSocket(chatPort)
+                // Close existing server socket if any
+                serverSocket?.close()
                 
-                while (isRunning && !serverSocket!!.isClosed) {
+                // Try to bind to the chat port with retries
+                var attempts = 0
+                var currentPort = chatPort
+                var socketCreated = false
+                
+                while (attempts < 5 && !socketCreated && currentCoroutineContext().isActive) {
                     try {
-                        val clientSocket = serverSocket!!.accept()
-                        handleNewClient(clientSocket)
-                    } catch (e: SocketException) {
-                        if (isRunning) {
-                            Log.e(tag, "Server socket error", e)
+                        serverSocket = ServerSocket(currentPort).apply {
+                            reuseAddress = true
+                            soTimeout = 1000 // 1 second timeout for accept operations
+                        }
+                        socketCreated = true
+                        Log.d(tag, "Chat server started on port $currentPort")
+                    } catch (e: java.net.BindException) {
+                        attempts++
+                        currentPort = chatPort + attempts
+                        Log.w(tag, "Chat port $currentPort in use, trying ${currentPort + 1}")
+                        if (attempts >= 5) {
+                            throw e
+                        }
+                    }
+                }
+
+                // Accept connections
+                while (currentCoroutineContext().isActive && isRunning && serverSocket != null) {
+                    try {
+                        val clientSocket = serverSocket?.accept()
+                        if (clientSocket != null) {
+                            serviceScope.launch {
+                                handleClientConnection(clientSocket)
+                            }
+                        }
+                    } catch (e: SocketTimeoutException) {
+                        // Timeout is normal, continue listening
+                    } catch (e: Exception) {
+                        if (currentCoroutineContext().isActive && isRunning) {
+                            Log.e(tag, "Error accepting client connection", e)
                         }
                     }
                 }
             } catch (e: Exception) {
-                Log.e(tag, "Error in chat server", e)
-            }
-        }
-    }
-    
-    private fun handleNewClient(clientSocket: Socket) {
-        serviceScope.launch {
-            try {
-                val clientIp = clientSocket.inetAddress.hostAddress ?: return@launch
-                connectedClients[clientIp] = clientSocket
-                
-                val reader = BufferedReader(InputStreamReader(clientSocket.getInputStream()))
-                
-                while (isRunning && !clientSocket.isClosed) {
-                    val message = reader.readLine() ?: break
-                    handleIncomingMessage(message, clientIp)
+                if (currentCoroutineContext().isActive && isRunning) {
+                    Log.e(tag, "Error starting chat server", e)
                 }
-                
-            } catch (e: Exception) {
-                Log.e(tag, "Error handling client", e)
-            } finally {
-                val clientIp = clientSocket.inetAddress.hostAddress
-                clientIp?.let { connectedClients.remove(it) }
-                clientSocket.close()
             }
         }
     }
-    
-    private fun handleIncomingMessage(messageJson: String, senderIp: String) {
+
+    private suspend fun handleClientConnection(socket: Socket) {
         try {
-            val json = JSONObject(messageJson)
-            val type = json.getString("type")
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val clientIp = socket.inetAddress.hostAddress ?: ""
             
-            when (type) {
+            connectedClients[clientIp] = socket
+            
+            while (currentCoroutineContext().isActive && isRunning && !socket.isClosed) {
+                val message = reader.readLine() ?: break
+                handleIncomingMessage(message, clientIp)
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error handling client connection", e)
+        } finally {
+            try {
+                socket.close()
+                connectedClients.remove(socket.inetAddress.hostAddress)
+            } catch (e: Exception) {
+                Log.e(tag, "Error closing client socket", e)
+            }
+        }
+    }
+
+    private fun handleDiscoveryMessage(data: String, address: InetAddress) {
+        try {
+            if (!data.startsWith(appSignature)) return
+
+            val parts = data.split("|")
+            if (parts.size >= 3) {
+                val userIp = parts[1]
+                val userName = parts[2]
+                val deviceModel = if (parts.size > 3) parts[3] else "Unknown"
+                val isAppUser = if (parts.size > 4) parts[4].toBoolean() else true
+
+                if (userIp != _chatState.value.myIpAddress) {
+                    userDeviceInfo[userIp] = DeviceInfo(
+                        ipAddress = userIp,
+                        deviceModel = deviceModel,
+                        isAppUser = isAppUser,
+                        lastSeen = System.currentTimeMillis()
+                    )
+
+                    discoveredUsers[userIp] = ChatUser(
+                        name = userName,
+                        deviceName = deviceModel,
+                        ipAddress = userIp,
+                        isOnline = true,
+                        lastSeen = System.currentTimeMillis(),
+                        unreadCount = unreadMessageCounts[userIp] ?: 0
+                    )
+
+                    userLastSeen[userIp] = System.currentTimeMillis()
+                    updateDiscoveryState()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error handling discovery message", e)
+        }
+    }
+
+    private suspend fun handleClient(socket: Socket) {
+        try {
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val clientIp = socket.inetAddress.hostAddress ?: ""
+            
+            connectedClients[clientIp] = socket
+            Log.d(tag, "Client connected: $clientIp")
+
+            while (currentCoroutineContext().isActive && !socket.isClosed && isRunning) {
+                val message = reader.readLine() ?: break
+                handleIncomingMessage(message, clientIp)
+            }
+        } catch (e: Exception) {
+            if (currentCoroutineContext().isActive && isRunning) {
+                Log.e(tag, "Error handling client", e)
+            }
+        } finally {
+            try {
+                socket.close()
+                connectedClients.remove(socket.inetAddress.hostAddress)
+            } catch (e: Exception) {
+                Log.e(tag, "Error closing client socket", e)
+            }
+        }
+    }
+
+    private suspend fun handleIncomingMessage(message: String, senderIp: String) {
+        try {
+            val json = JSONObject(message)
+            val messageType = json.optString("type", "")
+
+            when (messageType) {
                 "chat_message" -> {
+                    val messageId = json.optString("id", "")
+                    val content = json.optString("content", "")
+                    val senderName = json.optString("senderName", "")
+                    val timestamp = json.optLong("timestamp", System.currentTimeMillis())
                     val isPrivate = json.optBoolean("isPrivate", false)
                     val recipientIp = json.optString("recipientIp", "")
                     val isEncrypted = json.optBoolean("isEncrypted", false)
-                    var content = json.getString("content")
-                    
-                    // Decrypt if encrypted
+
+                    var finalContent = content
                     if (isEncrypted) {
-                        content = ChatEncryption.decryptMessage(content, senderIp)
+                        finalContent = ChatEncryption.decryptMessage(content, senderIp, _chatState.value.myIpAddress)
                     }
-                    
+
                     val chatMessage = ChatMessage(
-                        id = json.getString("id"),
-                        content = content,
-                        senderName = json.getString("senderName"),
+                        id = messageId,
+                        content = finalContent,
+                        senderName = senderName,
                         senderIp = senderIp,
-                        timestamp = json.getLong("timestamp"),
+                        timestamp = timestamp,
                         isFromMe = false,
                         isPrivate = isPrivate,
                         recipientIp = recipientIp,
-                        isEncrypted = isEncrypted
+                        recipientName = _chatState.value.myName,
+                        isEncrypted = isEncrypted,
+                        isRead = false,
+                        deliveryStatus = DeliveryStatus.DELIVERED
                     )
-                    
-                    if (isPrivate) {
-                        // Handle private message
+
+                    // Send delivery acknowledgment
+                    sendDeliveryAck(senderIp, messageId)
+
+                    if (isPrivate && recipientIp == _chatState.value.myIpAddress) {
+                        // Add to private message history
                         val currentPrivateMessages = privateMessageHistory.getOrPut(senderIp) { mutableListOf() }
                         currentPrivateMessages.add(chatMessage)
-                        
+
+                        // Update unread count
+                        unreadMessageCounts[senderIp] = (unreadMessageCounts[senderIp] ?: 0) + 1
+
                         // Auto-save private messages
                         dataManager.savePrivateMessages(senderIp, currentPrivateMessages)
-                        
+
                         _chatState.value = _chatState.value.copy(
                             privateMessages = privateMessageHistory.toMap()
                         )
-                    } else {
-                        // Handle group message
-                        val currentMessages = _chatState.value.messages.toMutableList()
+
+                        updateDiscoveryState()
+                        Log.d(tag, "Received private message from $senderName")
+                    } else if (!isPrivate) {
+                        // Add to group messages
+                        val currentState = _chatState.value
+                        val currentMessages = currentState.messages.toMutableList()
                         currentMessages.add(chatMessage)
-                        
+
                         // Auto-save group messages
                         dataManager.saveGroupMessages(currentMessages)
-                        
-                        _chatState.value = _chatState.value.copy(
-                            messages = currentMessages
-                        )
+
+                        _chatState.value = currentState.copy(messages = currentMessages)
+                        Log.d(tag, "Received group message from $senderName")
                     }
+                }
+                "delivery_ack" -> {
+                    val messageId = json.optString("messageId", "")
+                    updateMessageDeliveryStatus(messageId, DeliveryStatus.DELIVERED)
+                }
+                "read_receipt" -> {
+                    val messageId = json.optString("messageId", "")
+                    updateMessageDeliveryStatus(messageId, DeliveryStatus.READ)
                 }
             }
         } catch (e: Exception) {
-            Log.e(tag, "Error parsing incoming message", e)
+            Log.e(tag, "Error handling incoming message", e)
         }
     }
-    
-    private suspend fun startDiscoveryService(userName: String) {
+
+    private suspend fun sendDeliveryAck(recipientIp: String, messageId: String) {
+        try {
+            val ackJson = JSONObject().apply {
+                put("type", "delivery_ack")
+                put("messageId", messageId)
+            }.toString()
+
+            sendMessageToUser(recipientIp, ackJson)
+        } catch (e: Exception) {
+            Log.e(tag, "Error sending delivery ack", e)
+        }
+    }
+
+    private suspend fun sendReadReceipt(recipientIp: String, messageId: String) {
+        try {
+            val receiptJson = JSONObject().apply {
+                put("type", "read_receipt")
+                put("messageId", messageId)
+            }.toString()
+
+            sendMessageToUser(recipientIp, receiptJson)
+        } catch (e: Exception) {
+            Log.e(tag, "Error sending read receipt", e)
+        }
+    }
+
+    private fun updateMessageDeliveryStatus(messageId: String, status: DeliveryStatus) {
+        try {
+            val currentState = _chatState.value
+
+            // Update in group messages
+            val updatedGroupMessages = currentState.messages.map { message ->
+                if (message.id == messageId) {
+                    message.copy(deliveryStatus = status)
+                } else {
+                    message
+                }
+            }
+
+            // Update in private messages
+            val updatedPrivateMessages = currentState.privateMessages.mapValues { (_, messages) ->
+                messages.map { message ->
+                    if (message.id == messageId) {
+                        message.copy(deliveryStatus = status)
+                    } else {
+                        message
+                    }
+                }
+            }
+
+            _chatState.value = currentState.copy(
+                messages = updatedGroupMessages,
+                privateMessages = updatedPrivateMessages
+            )
+        } catch (e: Exception) {
+            Log.e(tag, "Error updating message delivery status", e)
+        }
+    }
+
+    private suspend fun startHeartbeatSender() {
+        withContext(Dispatchers.IO) {
+            while (currentCoroutineContext().isActive && isRunning) {
+                try {
+                    delay(5000) // Send heartbeat every 5 seconds
+                    if (!currentCoroutineContext().isActive || !isRunning) break
+                    
+                    broadcastEnhancedDiscovery()
+                } catch (e: CancellationException) {
+                    Log.d(tag, "Heartbeat sender cancelled")
+                    break
+                } catch (e: Exception) {
+                    if (currentCoroutineContext().isActive && isRunning) {
+                        Log.e(tag, "Error in heartbeat sender", e)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun startDiscoveryBroadcast() {
         withContext(Dispatchers.IO) {
             try {
-                Log.d(tag, "Creating discovery socket on port $discoveryPort")
-                discoverySocket = DatagramSocket(discoveryPort)
-                discoverySocket!!.broadcast = true
-                discoverySocket!!.soTimeout = 5000 // 5 second timeout for receive
-                
-                Log.d(tag, "Discovery socket created successfully")
-                
-                // Start discovery broadcast
-                serviceScope.launch {
-                    var broadcastCount = 0
-                    while (isRunning) {
-                        try {
-                            broadcastDiscovery(userName)
-                            broadcastCount++
-                            Log.d(tag, "Discovery broadcast #$broadcastCount sent")
-                            
-                            // Also try direct connection to common IP ranges for better discovery
-                            if (broadcastCount % 3 == 0) { // Every 3rd broadcast
-                                tryDirectDiscovery(userName)
-                            }
-                            
-                            delay(5000) // Broadcast every 5 seconds
-                        } catch (e: Exception) {
-                            Log.e(tag, "Error in discovery broadcast", e)
-                        }
-                    }
-                }
-                
-                // Listen for discovery responses
-                val buffer = ByteArray(1024)
-                var messageCount = 0
-                while (isRunning && !discoverySocket!!.isClosed) {
-                    try {
-                        val packet = DatagramPacket(buffer, buffer.size)
-                        discoverySocket!!.receive(packet)
-                        messageCount++
-                        Log.d(tag, "Received discovery message #$messageCount from ${packet.address.hostAddress}")
-                        handleDiscoveryMessage(packet)
-                    } catch (e: SocketTimeoutException) {
-                        // Timeout is expected, continue listening
-                        continue
-                    } catch (e: SocketException) {
-                        if (isRunning) {
-                            Log.e(tag, "Discovery socket error", e)
-                        }
-                        break
-                    } catch (e: Exception) {
-                        Log.e(tag, "Error receiving discovery message", e)
-                    }
-                }
-                
-                Log.d(tag, "Discovery service loop ended")
-                
-            } catch (e: BindException) {
-                Log.e(tag, "Discovery port $discoveryPort is already in use", e)
-                throw e
+                performComprehensiveNetworkScan()
+                performAdvancedNetworkScan()
+                Log.d(tag, "Initial discovery broadcast completed")
             } catch (e: Exception) {
-                Log.e(tag, "Error in discovery service", e)
-                throw e
-            }
-        }
-    }
-    
-    private fun broadcastDiscovery(userName: String) {
-        try {
-            val message = JSONObject().apply {
-                put("type", "discovery")
-                put("userName", userName)
-                put("deviceName", getDeviceName())
-                put("publicKey", ChatEncryption.getPublicKey())
-                put("sessionToken", sessionToken)
-                put("timestamp", System.currentTimeMillis())
-            }.toString()
-            
-            val broadcastAddress = getBroadcastAddress()
-            Log.d(tag, "Broadcasting discovery to: ${broadcastAddress.hostAddress}")
-            
-            val packet = DatagramPacket(
-                message.toByteArray(),
-                message.length,
-                broadcastAddress,
-                discoveryPort
-            )
-            
-            discoverySocket?.send(packet)
-            Log.d(tag, "Discovery broadcast sent successfully")
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error broadcasting discovery: ${e.message}", e)
-        }
-    }
-    
-    private fun handleDiscoveryMessage(packet: DatagramPacket) {
-        try {
-            val message = String(packet.data, 0, packet.length)
-            val json = JSONObject(message)
-            val type = json.getString("type")
-            
-            if (type == "discovery") {
-                val senderIp = packet.address.hostAddress ?: return
-                val myIp = getLocalIpAddress()
-                
-                Log.d(tag, "Processing discovery from $senderIp (my IP: $myIp)")
-                
-                // Don't add ourselves
-                if (senderIp == myIp) {
-                    Log.d(tag, "Ignoring discovery from self")
-                    return
+                if (currentCoroutineContext().isActive && isRunning) {
+                    Log.e(tag, "Error in discovery broadcast", e)
                 }
-                
-                val userName = json.getString("userName")
-                val deviceName = json.getString("deviceName")
-                
-                val user = ChatUser(
-                    name = userName,
-                    ipAddress = senderIp,
-                    deviceName = deviceName,
-                    publicKey = json.optString("publicKey", ""),
-                    isOnline = true,
-                    lastSeen = System.currentTimeMillis()
-                )
-                
-                val wasNewUser = !discoveredUsers.containsKey(senderIp)
-                discoveredUsers[senderIp] = user
-                
-                val currentUsers = discoveredUsers.values.toList()
-                _chatState.value = _chatState.value.copy(
-                    connectedUsers = currentUsers
-                )
-                
-                Log.d(tag, "User ${if (wasNewUser) "added" else "updated"}: $userName from $senderIp (total users: ${currentUsers.size})")
-                
-                // Send discovery response
-                sendDiscoveryResponse(packet.address)
             }
-        } catch (e: Exception) {
-            Log.e(tag, "Error handling discovery message: ${e.message}", e)
         }
     }
-    
-    private fun sendDiscoveryResponse(address: InetAddress) {
-        try {
-            val response = JSONObject().apply {
-                put("type", "discovery")
-                put("userName", _chatState.value.myName)
-                put("deviceName", getDeviceName())
-                put("publicKey", ChatEncryption.getPublicKey())
-                put("sessionToken", sessionToken)
-                put("timestamp", System.currentTimeMillis())
-            }.toString()
-            
-            val packet = DatagramPacket(
-                response.toByteArray(),
-                response.length,
-                address,
-                discoveryPort
-            )
-            
-            discoverySocket?.send(packet)
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error sending discovery response", e)
-        }
-    }
-    
-    private fun tryDirectDiscovery(userName: String) {
-        serviceScope.launch {
+
+    private suspend fun broadcastEnhancedDiscovery() {
+        withContext(Dispatchers.IO) {
             try {
-                val myIp = getLocalIpAddress()
-                val networkPrefix = myIp.substringBeforeLast(".")
+                val deviceInfo = "${Build.MODEL}_${Build.MANUFACTURER}"
+                val message = "$appSignature|${_chatState.value.myIpAddress}|${_chatState.value.myName}|$deviceInfo|true"
                 
-                Log.d(tag, "Starting direct discovery for network $networkPrefix.*")
+                val broadcastAddress = getBroadcastAddress()
+                val socket = DatagramSocket()
                 
-                // Try common IP ranges in the local network
-                for (i in 1..254) {
-                    if (!isRunning) break
-                    
-                    val targetIp = "$networkPrefix.$i"
-                    if (targetIp == myIp) continue // Skip self
-                    
-                    try {
-                        val message = JSONObject().apply {
-                            put("type", "discovery")
-                            put("userName", userName)
-                            put("deviceName", getDeviceName())
-                            put("publicKey", ChatEncryption.getPublicKey())
-                            put("sessionToken", sessionToken)
-                            put("timestamp", System.currentTimeMillis())
-                        }.toString()
-                        
-                        val packet = DatagramPacket(
-                            message.toByteArray(),
-                            message.length,
-                            InetAddress.getByName(targetIp),
-                            discoveryPort
-                        )
-                        
-                        discoverySocket?.send(packet)
-                    } catch (e: Exception) {
-                        // Ignore individual send failures - this is expected for many IPs
-                    }
-                    
-                    if (i % 50 == 0) {
-                        delay(100) // Small delay every 50 IPs to prevent overwhelming
-                    }
+                try {
+                    val data = message.toByteArray()
+                    val packet = DatagramPacket(data, data.size, broadcastAddress, discoveryPort)
+                    socket.send(packet)
+                    Log.d(tag, "Enhanced discovery broadcast sent")
+                } finally {
+                    socket.close()
                 }
-                
-                Log.d(tag, "Direct discovery scan completed for network $networkPrefix.*")
-                
             } catch (e: Exception) {
-                Log.e(tag, "Error in direct discovery", e)
+                if (currentCoroutineContext().isActive && isRunning) {
+                    Log.e(tag, "Error broadcasting enhanced discovery", e)
+                }
             }
         }
     }
-    
+
+    private fun getBroadcastAddress(): InetAddress {
+        val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val dhcp = wifiManager.dhcpInfo
+        val broadcast = dhcp.ipAddress and dhcp.netmask or dhcp.netmask.inv()
+        return InetAddress.getByAddress(
+            byteArrayOf(
+                (broadcast and 0xff).toByte(),
+                (broadcast shr 8 and 0xff).toByte(),
+                (broadcast shr 16 and 0xff).toByte(),
+                (broadcast shr 24 and 0xff).toByte()
+            )
+        )
+    }
+
+    private suspend fun performAdvancedNetworkScan() {
+        withContext(Dispatchers.IO) {
+            try {
+                val baseIp = getMyIpAddress().substringBeforeLast(".")
+                val jobs = mutableListOf<Job>()
+
+                for (i in 1..254) {
+                    val job = launch {
+                        val targetIp = "$baseIp.$i"
+                        if (targetIp != _chatState.value.myIpAddress) {
+                            try {
+                                val address = InetAddress.getByName(targetIp)
+                                if (address.isReachable(1000)) {
+                                    checkForAppUser(targetIp)
+                                }
+                            } catch (e: Exception) {
+                                // Ignore unreachable hosts
+                            }
+                        }
+                    }
+                    jobs.add(job)
+                }
+
+                jobs.joinAll()
+            } catch (e: Exception) {
+                Log.e(tag, "Error in advanced network scan", e)
+            }
+        }
+    }
+
+    private suspend fun checkForAppUser(ipAddress: String) {
+        try {
+            // Try to connect and check if it's an app user
+            val socket = Socket()
+            try {
+                socket.connect(InetSocketAddress(ipAddress, chatPort), 2000)
+                
+                // If connection successful, it's likely an app user
+                val deviceName = userDeviceInfo[ipAddress]?.deviceModel ?: "Unknown Device"
+                val lastSeen = userLastSeen[ipAddress] ?: System.currentTimeMillis()
+                
+                // Only add if not seen recently (avoid duplicates)
+                if (System.currentTimeMillis() - lastSeen > 10000) { // 10 seconds
+                    userLastSeen[ipAddress] = System.currentTimeMillis()
+                    
+                    val user = ChatUser(
+                        name = "User_${ipAddress.substringAfterLast(".")}",
+                        deviceName = deviceName,
+                        ipAddress = ipAddress,
+                        isOnline = true,
+                        lastSeen = System.currentTimeMillis(),
+                        unreadCount = unreadMessageCounts[ipAddress] ?: 0
+                    )
+                    
+                    discoveredUsers[ipAddress] = user
+                    updateDiscoveryState()
+                }
+            } finally {
+                socket.close()
+            }
+        } catch (e: Exception) {
+            // Not an app user or not reachable
+        }
+    }
+
+    private suspend fun performComprehensiveNetworkScan(currentState: ChatState = _chatState.value) {
+        withContext(Dispatchers.IO) {
+            try {
+                // Clean up offline users
+                val currentTime = System.currentTimeMillis()
+                val onlineUsers = discoveredUsers.filter { (_, user) ->
+                    val lastSeenTime = userLastSeen[user.ipAddress] ?: 0
+                    currentTime - lastSeenTime < 60000 // Consider offline after 1 minute
+                }
+
+                discoveredUsers.clear()
+                discoveredUsers.putAll(onlineUsers)
+
+                // Update discovery state
+                updateDiscoveryState()
+
+                val currentNetworkSSID = getCurrentNetworkSSID()
+                
+                if (System.currentTimeMillis() - lastNetworkScan > networkScanInterval) {
+                    lastNetworkScan = System.currentTimeMillis()
+
+                    serviceScope.launch {
+                        try {
+                            Log.d(tag, "Starting comprehensive network scan")
+                            performAdvancedNetworkScan()
+                            performComprehensiveNetworkScan(_chatState.value)
+                            Log.d(tag, "Network scan completed")
+                        } catch (e: Exception) {
+                            Log.e(tag, "Error in network scan", e)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Error in comprehensive network scan", e)
+            }
+        }
+    }
+
+    private fun getCurrentNetworkSSID(): String {
+        return try {
+            val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val connectionInfo = wifiManager.connectionInfo
+            connectionInfo.ssid?.removeSurrounding("\"") ?: "Unknown"
+        } catch (e: Exception) {
+            "Unknown"
+        }
+    }
+
     fun sendMessage(content: String, isPrivate: Boolean = false, recipientUser: ChatUser? = null) {
         if (content.isBlank()) return
-        
+
         serviceScope.launch {
             try {
                 val currentState = _chatState.value
                 var finalContent = content
                 val isEncrypted = currentState.encryptionEnabled && isPrivate
-                
+
                 // Encrypt private messages
                 if (isEncrypted && recipientUser != null) {
-                    finalContent = ChatEncryption.encryptMessage(content, recipientUser.ipAddress)
+                    finalContent = ChatEncryption.encryptMessage(content, currentState.myIpAddress, recipientUser.ipAddress)
                 }
-                
+
                 val message = ChatMessage(
-                    id = System.currentTimeMillis().toString(),
+                    id = "${System.currentTimeMillis()}_${currentState.myIpAddress}", // Unique ID
                     content = content, // Store original content for sender
                     senderName = currentState.myName,
                     senderIp = currentState.myIpAddress,
@@ -479,47 +730,72 @@ class LocalChatService(private val context: Context) {
                     isPrivate = isPrivate,
                     recipientIp = recipientUser?.ipAddress ?: "",
                     recipientName = recipientUser?.name ?: "",
-                    isEncrypted = isEncrypted
+                    isEncrypted = isEncrypted,
+                    isRead = true, // Sender has read their own message
+                    deliveryStatus = DeliveryStatus.SENDING
                 )
-                
+
                 if (isPrivate && recipientUser != null) {
                     // Add to private message history
                     val currentPrivateMessages = privateMessageHistory.getOrPut(recipientUser.ipAddress) { mutableListOf() }
                     currentPrivateMessages.add(message)
-                    
+
                     // Auto-save private messages
                     dataManager.savePrivateMessages(recipientUser.ipAddress, currentPrivateMessages)
-                    
+
                     _chatState.value = currentState.copy(
                         privateMessages = privateMessageHistory.toMap()
                     )
-                    
+
                     // Send private message
                     val messageJson = createMessageJson(message, finalContent)
-                    sendMessageToUser(recipientUser.ipAddress, messageJson)
+                    val success = sendMessageToUser(recipientUser.ipAddress, messageJson)
+                    
+                    // Update delivery status based on send result
+                    if (success) {
+                        updateMessageDeliveryStatus(message.id, DeliveryStatus.SENT)
+                        Log.d(tag, "Private message sent successfully to ${recipientUser.name}")
+                    } else {
+                        updateMessageDeliveryStatus(message.id, DeliveryStatus.FAILED)
+                        Log.w(tag, "Failed to send private message to ${recipientUser.name}")
+                    }
                 } else {
                     // Add to group messages
                     val currentMessages = currentState.messages.toMutableList()
                     currentMessages.add(message)
-                    
+
                     // Auto-save group messages
                     dataManager.saveGroupMessages(currentMessages)
-                    
+
                     _chatState.value = currentState.copy(messages = currentMessages)
-                    
+
                     // Send to all users
                     val messageJson = createMessageJson(message, finalContent)
+                    var successCount = 0
+                    val totalUsers = discoveredUsers.values.size
+                    
                     discoveredUsers.values.forEach { user ->
-                        sendMessageToUser(user.ipAddress, messageJson)
+                        val success = sendMessageToUser(user.ipAddress, messageJson)
+                        if (success) successCount++
                     }
+
+                    // Update delivery status based on send results
+                    val finalStatus = when {
+                        successCount == 0 -> DeliveryStatus.FAILED
+                        successCount == totalUsers -> DeliveryStatus.SENT
+                        else -> DeliveryStatus.SENT // Partial delivery still counts as sent
+                    }
+                    updateMessageDeliveryStatus(message.id, finalStatus)
+                    
+                    Log.d(tag, "Group message sent to $successCount/$totalUsers users")
                 }
-                
+
             } catch (e: Exception) {
                 Log.e(tag, "Error sending message", e)
             }
         }
     }
-    
+
     private fun createMessageJson(message: ChatMessage, content: String): String {
         return JSONObject().apply {
             put("type", "chat_message")
@@ -532,351 +808,142 @@ class LocalChatService(private val context: Context) {
             put("isEncrypted", message.isEncrypted)
         }.toString()
     }
-    
+
     fun switchChatMode(mode: ChatMode) {
         _chatState.value = _chatState.value.copy(currentChatMode = mode)
     }
-    
+
     fun selectUser(user: ChatUser?) {
         _chatState.value = _chatState.value.copy(
             selectedUser = user,
             currentChatMode = if (user != null) ChatMode.PRIVATE else ChatMode.GROUP
         )
     }
-    
+
     fun getPrivateMessages(userIp: String): List<ChatMessage> {
         return privateMessageHistory[userIp] ?: emptyList()
     }
-    
+
     fun markMessagesAsRead(userIp: String) {
-        // Update unread count for user
-        val user = discoveredUsers[userIp]
-        if (user != null) {
-            discoveredUsers[userIp] = user.copy(unreadCount = 0)
-            _chatState.value = _chatState.value.copy(
-                connectedUsers = discoveredUsers.values.toList()
-            )
+        serviceScope.launch {
+            try {
+                // Reset unread count
+                unreadMessageCounts[userIp] = 0
+
+                val currentPrivateMessages = privateMessageHistory[userIp]?.toMutableList()
+                currentPrivateMessages?.forEachIndexed { index, message ->
+                    if (!message.isFromMe && !message.isRead) {
+                        // Mark as read
+                        currentPrivateMessages[index] = message.copy(isRead = true)
+                        
+                        // Send read receipt to sender
+                        sendReadReceipt(message.senderIp, message.id)
+                    }
+                }
+
+                // Save updated messages
+                currentPrivateMessages?.let {
+                    dataManager.savePrivateMessages(userIp, it)
+
+                    _chatState.value = _chatState.value.copy(
+                        privateMessages = privateMessageHistory.toMap()
+                    )
+                }
+
+                updateDiscoveryState()
+            } catch (e: Exception) {
+                Log.e(tag, "Error marking messages as read", e)
+            }
         }
     }
-    
-    // Load saved chat data
-    private fun loadSavedChatData() {
-        try {
-            // Load group messages
-            val groupMessages = dataManager.loadGroupMessages()
+
+    private suspend fun sendMessageToUser(ipAddress: String, message: String): Boolean {
+        return try {
+            val socket = Socket()
+            socket.connect(InetSocketAddress(ipAddress, chatPort), 5000)
             
-            // Load private messages
-            val privateMessages = dataManager.loadAllPrivateMessages()
-            privateMessageHistory.clear()
-            privateMessages.forEach { (userIp, messages) ->
-                privateMessageHistory[userIp] = messages.toMutableList()
-            }
+            val writer = PrintWriter(socket.getOutputStream(), true)
+            writer.println(message)
             
-            // Load known users
-            val knownUsers = dataManager.loadKnownUsers()
-            knownUsers.forEach { user ->
-                discoveredUsers[user.ipAddress] = user.copy(isOnline = false)
-            }
-            
-            // Load chat settings
-            val (encryptionEnabled, _) = dataManager.loadChatSettings()
-            
-            // Update state with loaded data
-            _chatState.value = _chatState.value.copy(
-                messages = groupMessages,
-                privateMessages = privateMessages,
-                connectedUsers = discoveredUsers.values.toList(),
-                encryptionEnabled = encryptionEnabled
-            )
-            
+            socket.close()
+            true
         } catch (e: Exception) {
-            Log.e(tag, "Error loading saved chat data", e)
+            Log.e(tag, "Failed to send message to $ipAddress", e)
+            false
         }
     }
-    
-    // Save current chat data
+
     fun saveChatData() {
-        try {
-            val currentState = _chatState.value
-            
-            // Save group messages
-            dataManager.saveGroupMessages(currentState.messages)
-            
-            // Save private messages
-            privateMessageHistory.forEach { (userIp, messages) ->
-                dataManager.savePrivateMessages(userIp, messages)
+        serviceScope.launch {
+            try {
+                dataManager.saveGroupMessages(_chatState.value.messages)
+                privateMessageHistory.forEach { (userIp, messages) ->
+                    dataManager.savePrivateMessages(userIp, messages)
+                }
+                dataManager.saveDiscoveredUsers(discoveredUsers.values.toList())
+                Log.d(tag, "Chat data saved successfully")
+            } catch (e: Exception) {
+                Log.e(tag, "Error saving chat data", e)
             }
-            
-            // Save known users
-            dataManager.saveKnownUsers(discoveredUsers.values.toList())
-            
-            // Save chat settings
-            dataManager.saveChatSettings(currentState.encryptionEnabled, true)
-            
-            // Save my name
-            if (currentState.myName.isNotEmpty()) {
-                dataManager.saveMyName(currentState.myName)
-            }
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error saving chat data", e)
         }
     }
-    
-    // Clear all chat data
+
     fun clearAllChatData() {
-        try {
+        serviceScope.launch {
             dataManager.clearAllChatData()
-            
-            // Clear in-memory data
             privateMessageHistory.clear()
-            
-            // Update state
             _chatState.value = _chatState.value.copy(
                 messages = emptyList(),
                 privateMessages = emptyMap()
             )
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error clearing chat data", e)
         }
     }
-    
-    // Clear group messages only
+
     fun clearGroupMessages() {
-        try {
+        serviceScope.launch {
             dataManager.clearGroupMessages()
-            
-            _chatState.value = _chatState.value.copy(
-                messages = emptyList()
-            )
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error clearing group messages", e)
+            _chatState.value = _chatState.value.copy(messages = emptyList())
         }
     }
-    
-    // Clear private messages for specific user
+
     fun clearPrivateMessages(userIp: String) {
-        try {
+        serviceScope.launch {
             dataManager.clearPrivateMessages(userIp)
             privateMessageHistory.remove(userIp)
-            
             _chatState.value = _chatState.value.copy(
                 privateMessages = privateMessageHistory.toMap()
             )
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error clearing private messages", e)
         }
     }
-    
-    // Clear all private messages
+
     fun clearAllPrivateMessages() {
-        try {
-            dataManager.clearAllPrivateMessages()
-            privateMessageHistory.clear()
-            
-            _chatState.value = _chatState.value.copy(
-                privateMessages = emptyMap()
-            )
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error clearing all private messages", e)
-        }
-    }
-    
-    // Get chat statistics
-    fun getChatStatistics(): com.bnaveen07.wificonnect.data.ChatStatistics {
-        return dataManager.getChatStatistics()
-    }
-    
-    // Export chat data as JSON string
-    fun exportChatData(): String {
-        return try {
-            val exportData = org.json.JSONObject().apply {
-                put("groupMessages", org.json.JSONArray().apply {
-                    _chatState.value.messages.forEach { message ->
-                        put(messageToExportJson(message))
-                    }
-                })
-                
-                put("privateMessages", org.json.JSONObject().apply {
-                    privateMessageHistory.forEach { (userIp, messages) ->
-                        put(userIp, org.json.JSONArray().apply {
-                            messages.forEach { message ->
-                                put(messageToExportJson(message))
-                            }
-                        })
-                    }
-                })
-                
-                put("exportTime", System.currentTimeMillis())
-                put("appVersion", "1.0")
-            }
-            exportData.toString(2) // Pretty print with indent
-        } catch (e: Exception) {
-            Log.e(tag, "Error exporting chat data", e)
-            "{\"error\": \"Failed to export chat data\"}"
-        }
-    }
-    
-    private fun messageToExportJson(message: ChatMessage): org.json.JSONObject {
-        return org.json.JSONObject().apply {
-            put("id", message.id)
-            put("content", message.content)
-            put("senderName", message.senderName)
-            put("timestamp", message.timestamp)
-            put("formattedTime", message.formattedTime)
-            put("isFromMe", message.isFromMe)
-            put("isPrivate", message.isPrivate)
-            if (message.isPrivate) {
-                put("recipientName", message.recipientName)
-            }
-        }
-    }
-    
-    private suspend fun sendMessageToUser(ipAddress: String, message: String) {
-        withContext(Dispatchers.IO) {
-            try {
-                val socket = Socket()
-                socket.connect(InetSocketAddress(ipAddress, chatPort), 5000)
-                
-                val writer = PrintWriter(socket.getOutputStream(), true)
-                writer.println(message)
-                
-                socket.close()
-                
-            } catch (e: Exception) {
-                Log.d(tag, "Could not send message to $ipAddress: ${e.message}")
-            }
-        }
-    }
-    
-    private fun getLocalIpAddress(): String {
-        try {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val wifiInfo = wifiManager.connectionInfo
-            val ipInt = wifiInfo.ipAddress
-            
-            // Check if we have a valid IP address
-            if (ipInt == 0) {
-                Log.w(tag, "WiFi IP address is 0, trying alternative method")
-                return getAlternativeIpAddress()
-            }
-            
-            val ipAddress = String.format(
-                "%d.%d.%d.%d",
-                ipInt and 0xff,
-                ipInt shr 8 and 0xff,
-                ipInt shr 16 and 0xff,
-                ipInt shr 24 and 0xff
-            )
-            
-            Log.d(tag, "Found local IP address: $ipAddress")
-            return ipAddress
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error getting WiFi IP address", e)
-            return getAlternativeIpAddress()
-        }
-    }
-    
-    private fun getAlternativeIpAddress(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                if (!networkInterface.isLoopback && networkInterface.isUp) {
-                    val addresses = networkInterface.inetAddresses
-                    while (addresses.hasMoreElements()) {
-                        val address = addresses.nextElement()
-                        if (address is Inet4Address && !address.isLoopbackAddress) {
-                            val ipAddress = address.hostAddress ?: continue
-                            // Check if it's a local network address
-                            if (ipAddress.startsWith("192.168.") || 
-                                ipAddress.startsWith("10.") || 
-                                ipAddress.startsWith("172.")) {
-                                Log.d(tag, "Found alternative IP address: $ipAddress")
-                                return ipAddress
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "Error getting alternative IP address", e)
-        }
-        
-        Log.w(tag, "Could not find valid IP address, using localhost")
-        return "127.0.0.1"
-    }
-    
-    private fun getBroadcastAddress(): InetAddress {
-        try {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val dhcpInfo = wifiManager.dhcpInfo
-            
-            if (dhcpInfo.ipAddress == 0 || dhcpInfo.netmask == 0) {
-                Log.w(tag, "DHCP info not available, using default broadcast")
-                return InetAddress.getByName("255.255.255.255")
-            }
-            
-            val broadcast = dhcpInfo.ipAddress or (dhcpInfo.netmask.inv())
-            val bytes = ByteArray(4)
-            bytes[0] = (broadcast and 0xff).toByte()
-            bytes[1] = (broadcast shr 8 and 0xff).toByte()
-            bytes[2] = (broadcast shr 16 and 0xff).toByte()
-            bytes[3] = (broadcast shr 24 and 0xff).toByte()
-            
-            val broadcastAddress = InetAddress.getByAddress(bytes)
-            Log.d(tag, "Found broadcast address: ${broadcastAddress.hostAddress}")
-            return broadcastAddress
-            
-        } catch (e: Exception) {
-            Log.e(tag, "Error getting broadcast address", e)
-            return try {
-                InetAddress.getByName("255.255.255.255")
-            } catch (ex: Exception) {
-                Log.e(tag, "Failed to get default broadcast address", ex)
-                throw ex
-            }
-        }
-    }
-    
-    private fun getDeviceName(): String {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
-                android.provider.Settings.Global.getString(
-                    context.contentResolver,
-                    android.provider.Settings.Global.DEVICE_NAME
-                ) ?: Build.MODEL
-            } else {
-                Build.MODEL
-            }
-        } catch (e: Exception) {
-            Build.MODEL
-        }
-    }
-    
-    fun refreshDiscovery() {
-        if (!isRunning) return
-        
         serviceScope.launch {
-            try {
-                Log.d(tag, "Manually refreshing discovery...")
-                val userName = _chatState.value.myName
-                
-                // Send immediate broadcast
-                broadcastDiscovery(userName)
-                
-                // Try direct discovery
-                tryDirectDiscovery(userName)
-                
-                Log.d(tag, "Manual discovery refresh completed")
-            } catch (e: Exception) {
-                Log.e(tag, "Error in manual discovery refresh", e)
+            privateMessageHistory.keys.forEach { userIp ->
+                dataManager.clearPrivateMessages(userIp)
             }
+            privateMessageHistory.clear()
+            _chatState.value = _chatState.value.copy(privateMessages = emptyMap())
+        }
+    }
+
+    fun getChatStatistics(): ChatStatistics {
+        val currentState = _chatState.value
+        return ChatStatistics(
+            totalUsers = discoveredUsers.size,
+            totalGroupMessages = currentState.messages.size,
+            totalPrivateMessages = privateMessageHistory.values.sumOf { it.size },
+            unreadMessages = unreadMessageCounts.values.sum()
+        )
+    }
+
+    fun exportChatData(): String {
+        return dataManager.exportChatData(_chatState.value.messages, privateMessageHistory.toMap())
+    }
+
+    fun refreshDiscovery() {
+        serviceScope.launch {
+            broadcastEnhancedDiscovery()
+            performAdvancedNetworkScan()
         }
     }
 }

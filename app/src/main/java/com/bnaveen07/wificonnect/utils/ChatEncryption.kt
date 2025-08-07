@@ -12,31 +12,31 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.random.Random
 
 object ChatEncryption {
-    
+
     private var keyPair: KeyPair? = null
     private val symmetricKeys = mutableMapOf<String, SecretKey>()
-    
+
     fun generateKeyPair(): KeyPair {
         val keyGen = KeyPairGenerator.getInstance("RSA")
         keyGen.initialize(2048)
         keyPair = keyGen.generateKeyPair()
         return keyPair!!
     }
-    
+
     fun getPublicKey(): String {
-        return keyPair?.public?.let { 
+        return keyPair?.public?.let {
             Base64.encodeToString(it.encoded, Base64.DEFAULT)
         } ?: ""
     }
-    
+
     fun getPrivateKey(): PrivateKey? {
         return keyPair?.private
     }
-    
+
     // Simple symmetric encryption for messages
-    fun encryptMessage(message: String, userIp: String): String {
+    fun encryptMessage(message: String, myIp: String, otherUserIp: String): String {
         return try {
-            val key = getOrCreateSymmetricKey(userIp)
+            val key = deriveSymmetricKey(myIp, otherUserIp)
             val cipher = Cipher.getInstance("AES")
             cipher.init(Cipher.ENCRYPT_MODE, key)
             val encryptedBytes = cipher.doFinal(message.toByteArray())
@@ -45,10 +45,10 @@ object ChatEncryption {
             message // Return original if encryption fails
         }
     }
-    
-    fun decryptMessage(encryptedMessage: String, userIp: String): String {
+
+    fun decryptMessage(encryptedMessage: String, myIp: String, otherUserIp: String): String {
         return try {
-            val key = getOrCreateSymmetricKey(userIp)
+            val key = deriveSymmetricKey(myIp, otherUserIp)
             val cipher = Cipher.getInstance("AES")
             cipher.init(Cipher.DECRYPT_MODE, key)
             val encryptedBytes = Base64.decode(encryptedMessage, Base64.DEFAULT)
@@ -58,17 +58,7 @@ object ChatEncryption {
             encryptedMessage // Return original if decryption fails
         }
     }
-    
-    private fun getOrCreateSymmetricKey(userIp: String): SecretKey {
-        return symmetricKeys[userIp] ?: run {
-            val keyGen = KeyGenerator.getInstance("AES")
-            keyGen.init(256)
-            val key = keyGen.generateKey()
-            symmetricKeys[userIp] = key
-            key
-        }
-    }
-    
+
     // Simple hash-based key derivation for consistent keys across users
     fun deriveSymmetricKey(userIp1: String, userIp2: String): SecretKey {
         val combined = listOf(userIp1, userIp2).sorted().joinToString("")
@@ -79,7 +69,7 @@ object ChatEncryption {
         }
         return SecretKeySpec(keyBytes, "AES")
     }
-    
+
     // Generate session token for user verification
     fun generateSessionToken(): String {
         val chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"

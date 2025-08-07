@@ -42,44 +42,21 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.bnaveen07.wificonnect.model.*
 import com.bnaveen07.wificonnect.viewmodel.ChatViewModel
-import com.bnaveen07.wificonnect.service.LocalChatService
 import com.bnaveen07.wificonnect.ui.components.ChatDataManagementDialog
 import kotlinx.coroutines.launch
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LocalChatScreen(
-    userName: String = "",
-    userIp: String? = null,
-    isPrivateChat: Boolean = false,
-    onNavigateBack: () -> Unit = {},
-    chatService: LocalChatService? = null,
+fun EnhancedLocalChatScreen(
+    onBack: () -> Unit,
     viewModel: ChatViewModel = viewModel()
 ) {
-    // Configure viewModel to use the provided chatService if available
-    LaunchedEffect(chatService) {
-        if (chatService != null) {
-            viewModel.setChatService(chatService)
-        }
-    }
-    
-    // Always use viewModel for state consistency
-    val chatState = viewModel.chatState.observeAsState(ChatState()).value
+    val chatState by viewModel.chatState.observeAsState(ChatState())
     var showUserNameDialog by remember { mutableStateOf(false) }
     var showDataManagementDialog by remember { mutableStateOf(false) }
     var showUserList by remember { mutableStateOf(false) }
-    
-    // Helper function to send messages
-    val sendMessage: (String, Boolean, ChatUser?) -> Unit = { content, isPrivate, recipient ->
-        if (isPrivate && recipient != null) {
-            viewModel.sendPrivateMessage(content, recipient)
-        } else {
-            viewModel.sendMessage(content)
-        }
-    }
     var showSettings by remember { mutableStateOf(false) }
-
+    
     // Check for saved user name and auto-start if available
     LaunchedEffect(Unit) {
         if (!chatState.isEnabled && viewModel.hasSavedUserName()) {
@@ -89,47 +66,37 @@ fun LocalChatScreen(
             }
         }
     }
-    
-    // Mark messages as read when viewing private chat
-    LaunchedEffect(isPrivateChat, userIp) {
-        if (isPrivateChat && userIp != null) {
-            viewModel.markMessagesAsRead(userIp)
-        }
-    }
 
     Scaffold(
         topBar = {
             EnhancedTopBar(
                 chatState = chatState,
-                onBack = onNavigateBack,
+                onBack = onBack,
                 onUserListClick = { showUserList = !showUserList },
                 onSettingsClick = { showSettings = true },
-                onModeToggle = {
-                    val newMode = if (chatState.currentChatMode == ChatMode.GROUP)
+                onModeToggle = { 
+                    val newMode = if (chatState.currentChatMode == ChatMode.GROUP) 
                         ChatMode.PRIVATE else ChatMode.GROUP
                     viewModel.switchChatMode(newMode)
                     if (newMode == ChatMode.GROUP) {
                         viewModel.selectUser(null)
                     }
                 },
-                onRefresh = { 
-                    viewModel.refreshDiscovery()
-                }
+                onRefresh = { viewModel.refreshDiscovery() }
             )
         },
         bottomBar = {
             if (chatState.isEnabled && chatState.connectionStatus == ChatConnectionStatus.CONNECTED) {
                 EnhancedBottomInputBar(
                     chatState = chatState,
-                    viewModel = viewModel,
-                    sendMessage = sendMessage
+                    viewModel = viewModel
                 )
             }
         },
         floatingActionButton = {
             EnhancedFAB(
                 chatState = chatState,
-                onClick = {
+                onClick = { 
                     if (!chatState.isEnabled) {
                         if (viewModel.hasSavedUserName()) {
                             val savedName = viewModel.getSavedUserName()
@@ -161,12 +128,12 @@ fun LocalChatScreen(
                     onCloseList = { showUserList = false }
                 )
             }
-
+            
             // Main Content Area
             when {
                 !chatState.isEnabled -> {
                     EnhancedWelcomeScreen(
-                        onStartChat = {
+                        onStartChat = { 
                             if (viewModel.hasSavedUserName()) {
                                 val savedName = viewModel.getSavedUserName()
                                 viewModel.startChat(savedName)
@@ -184,10 +151,9 @@ fun LocalChatScreen(
                 chatState.connectionStatus == ChatConnectionStatus.ERROR -> {
                     EnhancedErrorScreen(
                         chatState = chatState,
-                        onRetry = {
+                        onRetry = { 
                             if (viewModel.hasSavedUserName()) {
-                                val savedName = viewModel.getSavedUserName()
-                                viewModel.startChat(savedName)
+                                viewModel.startChat(viewModel.getSavedUserName())
                             }
                         }
                     )
@@ -201,31 +167,30 @@ fun LocalChatScreen(
             }
         }
     }
-
+    
     // Dialogs
     if (showUserNameDialog) {
         EnhancedUserNameDialog(
             onConfirm = { userName ->
-                viewModel.saveUserName(userName)
                 viewModel.startChat(userName)
                 showUserNameDialog = false
             },
             onDismiss = { showUserNameDialog = false }
         )
     }
-
+    
     if (showDataManagementDialog) {
         ChatDataManagementDialog(
             chatViewModel = viewModel,
             onDismiss = { showDataManagementDialog = false }
         )
     }
-
+    
     if (showSettings) {
         EnhancedSettingsDialog(
             chatState = chatState,
             onDismiss = { showSettings = false },
-            onDataManagement = {
+            onDataManagement = { 
                 showSettings = false
                 showDataManagementDialog = true
             }
@@ -254,7 +219,7 @@ private fun EnhancedTopBar(
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
-
+                
                 if (chatState.isEnabled) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -274,13 +239,13 @@ private fun EnhancedTopBar(
                                     CircleShape
                                 )
                         )
-
+                        
                         Text(
                             text = "${chatState.connectedUsers.size} users online",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                         )
-
+                        
                         if (chatState.myIpAddress.isNotEmpty() && chatState.myIpAddress != "127.0.0.1") {
                             Text(
                                 text = "• ${chatState.myIpAddress}",
@@ -308,7 +273,7 @@ private fun EnhancedTopBar(
                         contentDescription = "Refresh"
                     )
                 }
-
+                
                 IconButton(onClick = onUserListClick) {
                     Badge(
                         containerColor = MaterialTheme.colorScheme.primary
@@ -324,7 +289,7 @@ private fun EnhancedTopBar(
                         contentDescription = "Users"
                     )
                 }
-
+                
                 IconButton(onClick = onModeToggle) {
                     Icon(
                         when (chatState.currentChatMode) {
@@ -335,7 +300,7 @@ private fun EnhancedTopBar(
                     )
                 }
             }
-
+            
             IconButton(onClick = onSettingsClick) {
                 Icon(
                     Icons.Default.Settings,
@@ -361,10 +326,10 @@ private fun EnhancedFAB(
 ) {
     val scale by animateFloatAsState(
         targetValue = 1f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy), 
         label = "FAB Scale"
     )
-
+    
     FloatingActionButton(
         onClick = onClick,
         modifier = Modifier.scale(scale),
@@ -415,26 +380,26 @@ private fun EnhancedUserListPanel(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
-
+                
                 IconButton(onClick = onCloseList) {
                     Icon(Icons.Default.Close, contentDescription = "Close")
                 }
             }
-
+            
             Spacer(modifier = Modifier.height(8.dp))
-
+            
             // Group chat option
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable {
+                    .clickable { 
                         viewModel.selectUser(null)
                         viewModel.switchChatMode(ChatMode.GROUP)
                         onCloseList()
                     },
                 colors = CardDefaults.cardColors(
-                    containerColor = if (chatState.currentChatMode == ChatMode.GROUP)
-                        MaterialTheme.colorScheme.primaryContainer
+                    containerColor = if (chatState.currentChatMode == ChatMode.GROUP) 
+                        MaterialTheme.colorScheme.primaryContainer 
                     else MaterialTheme.colorScheme.surfaceVariant
                 )
             ) {
@@ -448,15 +413,15 @@ private fun EnhancedUserListPanel(
                         contentDescription = "Group Chat",
                         tint = MaterialTheme.colorScheme.primary
                     )
-
+                    
                     Text(
                         text = "Group Chat",
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium
                     )
-
+                    
                     Spacer(modifier = Modifier.weight(1f))
-
+                    
                     if (chatState.currentChatMode == ChatMode.GROUP) {
                         Icon(
                             Icons.Default.CheckCircle,
@@ -466,23 +431,23 @@ private fun EnhancedUserListPanel(
                     }
                 }
             }
-
+            
             if (chatState.connectedUsers.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(12.dp))
-
+                
                 chatState.connectedUsers.forEach { user ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 2.dp)
-                            .clickable {
+                            .clickable { 
                                 viewModel.selectUser(user)
                                 viewModel.switchChatMode(ChatMode.PRIVATE)
                                 onCloseList()
                             },
                         colors = CardDefaults.cardColors(
-                            containerColor = if (chatState.selectedUser?.ipAddress == user.ipAddress)
-                                MaterialTheme.colorScheme.primaryContainer
+                            containerColor = if (chatState.selectedUser?.ipAddress == user.ipAddress) 
+                                MaterialTheme.colorScheme.primaryContainer 
                             else MaterialTheme.colorScheme.surfaceVariant
                         )
                     ) {
@@ -508,21 +473,21 @@ private fun EnhancedUserListPanel(
                                     color = MaterialTheme.colorScheme.primary
                                 )
                             }
-
+                            
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = user.name,
                                     style = MaterialTheme.typography.bodyLarge,
                                     fontWeight = FontWeight.Medium
                                 )
-
+                                
                                 Text(
                                     text = "${user.deviceName} • ${user.ipAddress}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                                 )
                             }
-
+                            
                             if (chatState.selectedUser?.ipAddress == user.ipAddress) {
                                 Icon(
                                     Icons.Default.CheckCircle,
@@ -550,7 +515,7 @@ private fun EnhancedUserListPanel(
                             modifier = Modifier.size(48.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )
-
+                        
                         Text(
                             text = "No users discovered",
                             style = MaterialTheme.typography.bodyMedium,
@@ -566,13 +531,12 @@ private fun EnhancedUserListPanel(
 @Composable
 private fun EnhancedBottomInputBar(
     chatState: ChatState,
-    viewModel: ChatViewModel,
-    sendMessage: (String, Boolean, ChatUser?) -> Unit
+    viewModel: ChatViewModel
 ) {
     var messageText by remember { mutableStateOf("") }
     val keyboardController = LocalSoftwareKeyboardController.current
     val coroutineScope = rememberCoroutineScope()
-
+    
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -597,20 +561,20 @@ private fun EnhancedBottomInputBar(
                     modifier = Modifier.size(16.dp),
                     tint = MaterialTheme.colorScheme.primary
                 )
-
+                
                 Text(
                     text = when (chatState.currentChatMode) {
                         ChatMode.GROUP -> "Sending to group chat"
-                        ChatMode.PRIVATE -> if (chatState.selectedUser != null)
-                            "Private message to ${chatState.selectedUser!!.name}"
+                        ChatMode.PRIVATE -> if (chatState.selectedUser != null) 
+                            "Private message to ${chatState.selectedUser!!.name}" 
                         else "Select a user for private chat"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                 )
-
+                
                 Spacer(modifier = Modifier.weight(1f))
-
+                
                 if (chatState.currentChatMode == ChatMode.PRIVATE && chatState.selectedUser != null) {
                     Text(
                         text = "🔒 Encrypted",
@@ -619,9 +583,9 @@ private fun EnhancedBottomInputBar(
                     )
                 }
             }
-
+            
             Spacer(modifier = Modifier.height(8.dp))
-
+            
             // Input field
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -635,27 +599,27 @@ private fun EnhancedBottomInputBar(
                     placeholder = {
                         Text(
                             text = when {
-                                chatState.currentChatMode == ChatMode.PRIVATE && chatState.selectedUser == null ->
+                                chatState.currentChatMode == ChatMode.PRIVATE && chatState.selectedUser == null -> 
                                     "Select a user to start chatting..."
-                                chatState.currentChatMode == ChatMode.GROUP ->
+                                chatState.currentChatMode == ChatMode.GROUP -> 
                                     "Type a message to everyone..."
-                                chatState.currentChatMode == ChatMode.PRIVATE && chatState.selectedUser != null ->
+                                chatState.currentChatMode == ChatMode.PRIVATE && chatState.selectedUser != null -> 
                                     "Type a private message..."
                                 else -> "Ready to chat..."
                             }
                         )
                     },
-                    enabled = chatState.currentChatMode == ChatMode.GROUP ||
+                    enabled = chatState.currentChatMode == ChatMode.GROUP || 
                              (chatState.currentChatMode == ChatMode.PRIVATE && chatState.selectedUser != null),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(
-                        onSend = {
+                        onSend = { 
                             if (messageText.isNotBlank()) {
                                 when (chatState.currentChatMode) {
-                                    ChatMode.GROUP -> sendMessage(messageText.trim(), false, null)
+                                    ChatMode.GROUP -> viewModel.sendMessage(messageText.trim())
                                     ChatMode.PRIVATE -> {
                                         chatState.selectedUser?.let { user ->
-                                            sendMessage(messageText.trim(), true, user)
+                                            viewModel.sendPrivateMessage(messageText.trim(), user)
                                         }
                                     }
                                 }
@@ -668,16 +632,16 @@ private fun EnhancedBottomInputBar(
                     maxLines = 4,
                     shape = RoundedCornerShape(20.dp)
                 )
-
+                
                 // Send button
                 FloatingActionButton(
                     onClick = {
                         if (messageText.isNotBlank()) {
                             when (chatState.currentChatMode) {
-                                ChatMode.GROUP -> sendMessage(messageText.trim(), false, null)
+                                ChatMode.GROUP -> viewModel.sendMessage(messageText.trim())
                                 ChatMode.PRIVATE -> {
                                     chatState.selectedUser?.let { user ->
-                                        sendMessage(messageText.trim(), true, user)
+                                        viewModel.sendPrivateMessage(messageText.trim(), user)
                                     }
                                 }
                             }
@@ -686,18 +650,18 @@ private fun EnhancedBottomInputBar(
                         }
                     },
                     modifier = Modifier.size(48.dp),
-                    containerColor = if (messageText.isNotBlank() &&
-                        (chatState.currentChatMode == ChatMode.GROUP || chatState.selectedUser != null))
-                        MaterialTheme.colorScheme.primary
+                    containerColor = if (messageText.isNotBlank() && 
+                        (chatState.currentChatMode == ChatMode.GROUP || chatState.selectedUser != null)) 
+                        MaterialTheme.colorScheme.primary 
                     else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
                 ) {
                     Icon(
                         Icons.Default.Send,
                         contentDescription = "Send Message",
                         modifier = Modifier.size(20.dp),
-                        tint = if (messageText.isNotBlank() &&
-                            (chatState.currentChatMode == ChatMode.GROUP || chatState.selectedUser != null))
-                            MaterialTheme.colorScheme.onPrimary
+                        tint = if (messageText.isNotBlank() && 
+                            (chatState.currentChatMode == ChatMode.GROUP || chatState.selectedUser != null)) 
+                            MaterialTheme.colorScheme.onPrimary 
                         else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                     )
                 }
@@ -737,7 +701,7 @@ private fun EnhancedWelcomeScreen(
                         repeatMode = RepeatMode.Reverse
                     ), label = "Icon Scale"
                 )
-
+                
                 Icon(
                     Icons.Default.Chat,
                     contentDescription = "Chat",
@@ -746,7 +710,7 @@ private fun EnhancedWelcomeScreen(
                         .scale(scale),
                     tint = MaterialTheme.colorScheme.primary
                 )
-
+                
                 Text(
                     text = "WiFi Connect Chat",
                     style = MaterialTheme.typography.headlineMedium,
@@ -754,14 +718,14 @@ private fun EnhancedWelcomeScreen(
                     color = MaterialTheme.colorScheme.onSurface,
                     textAlign = TextAlign.Center
                 )
-
+                
                 Text(
                     text = "Connect and chat with nearby devices on the same WiFi network",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
                 )
-
+                
                 Button(
                     onClick = onStartChat,
                     modifier = Modifier.fillMaxWidth()
@@ -776,7 +740,7 @@ private fun EnhancedWelcomeScreen(
                         if (hasSavedName) "Start Chat as $savedName" else "Set Your Name & Start"
                     )
                 }
-
+                
                 // Features card
                 Card(
                     colors = CardDefaults.cardColors(
@@ -793,10 +757,10 @@ private fun EnhancedWelcomeScreen(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
                         )
-
+                        
                         listOf(
                             "💬 Real-time messaging",
-                            "👥 Group & private chats",
+                            "👥 Group & private chats", 
                             "🔒 End-to-end encryption",
                             "📡 No internet required",
                             "🔍 Auto device discovery"
@@ -845,13 +809,13 @@ private fun EnhancedConnectingScreen(
                         repeatMode = RepeatMode.Restart
                     ), label = "Rotation"
                 )
-
+                
                 CircularProgressIndicator(
                     modifier = Modifier.size(64.dp),
                     color = MaterialTheme.colorScheme.primary,
                     strokeWidth = 6.dp
                 )
-
+                
                 Text(
                     text = "🔄 Connecting to Chat Service",
                     style = MaterialTheme.typography.headlineSmall,
@@ -859,16 +823,16 @@ private fun EnhancedConnectingScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
                 )
-
+                
                 Text(
                     text = "Setting up secure connections and discovering nearby users...",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
                     textAlign = TextAlign.Center
                 )
-
+                
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
-
+                
                 // Connection details
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -922,7 +886,7 @@ private fun EnhancedErrorScreen(
                     modifier = Modifier.size(64.dp),
                     tint = MaterialTheme.colorScheme.error
                 )
-
+                
                 Text(
                     text = "❌ Connection Failed",
                     style = MaterialTheme.typography.headlineSmall,
@@ -930,14 +894,14 @@ private fun EnhancedErrorScreen(
                     color = MaterialTheme.colorScheme.error,
                     textAlign = TextAlign.Center
                 )
-
+                
                 Text(
                     text = "Unable to start the chat service. Please check your WiFi connection and try again.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
                     textAlign = TextAlign.Center
                 )
-
+                
                 Button(
                     onClick = onRetry,
                     modifier = Modifier.fillMaxWidth(),
@@ -966,7 +930,7 @@ private fun EnhancedChatArea(
 ) {
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
-
+    
     // Get current messages based on mode
     val currentMessages = remember(chatState.currentChatMode, chatState.selectedUser, chatState.messages, chatState.privateMessages) {
         when (chatState.currentChatMode) {
@@ -978,7 +942,7 @@ private fun EnhancedChatArea(
             }
         }
     }
-
+    
     // Auto-scroll to bottom when new messages arrive
     LaunchedEffect(currentMessages.size) {
         if (currentMessages.isNotEmpty()) {
@@ -987,7 +951,7 @@ private fun EnhancedChatArea(
             }
         }
     }
-
+    
     Box(modifier = modifier.fillMaxSize()) {
         if (currentMessages.isEmpty()) {
             // Empty state
@@ -1007,14 +971,14 @@ private fun EnhancedChatArea(
                     modifier = Modifier.size(72.dp),
                     tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
                 )
-
+                
                 Spacer(modifier = Modifier.height(16.dp))
-
+                
                 Text(
                     text = when (chatState.currentChatMode) {
                         ChatMode.GROUP -> "Welcome to Group Chat! 👥"
-                        ChatMode.PRIVATE -> if (chatState.selectedUser != null)
-                            "Private chat with ${chatState.selectedUser!!.name} 💬"
+                        ChatMode.PRIVATE -> if (chatState.selectedUser != null) 
+                            "Private chat with ${chatState.selectedUser!!.name} 💬" 
                         else "Select a user to start private chat 👤"
                     },
                     style = MaterialTheme.typography.headlineSmall,
@@ -1022,12 +986,12 @@ private fun EnhancedChatArea(
                     color = MaterialTheme.colorScheme.onSurface,
                     textAlign = TextAlign.Center
                 )
-
+                
                 Text(
                     text = when (chatState.currentChatMode) {
                         ChatMode.GROUP -> "Start chatting with ${chatState.connectedUsers.size} connected users"
-                        ChatMode.PRIVATE -> if (chatState.selectedUser != null)
-                            "Your conversation is end-to-end encrypted"
+                        ChatMode.PRIVATE -> if (chatState.selectedUser != null) 
+                            "Your conversation is end-to-end encrypted" 
                         else "Choose someone from the users list above"
                     },
                     style = MaterialTheme.typography.bodyLarge,
@@ -1089,10 +1053,10 @@ private fun EnhancedMessageBubble(
                     color = MaterialTheme.colorScheme.primary
                 )
             }
-
+            
             Spacer(modifier = Modifier.width(8.dp))
         }
-
+        
         Card(
             modifier = Modifier.widthIn(max = 280.dp),
             colors = CardDefaults.cardColors(
@@ -1130,7 +1094,7 @@ private fun EnhancedMessageBubble(
                                 MaterialTheme.colorScheme.primary
                             }
                         )
-
+                        
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -1147,7 +1111,7 @@ private fun EnhancedMessageBubble(
                                     }
                                 )
                             }
-
+                            
                             if (isPrivateChat) {
                                 Icon(
                                     Icons.Default.PersonPin,
@@ -1162,10 +1126,10 @@ private fun EnhancedMessageBubble(
                             }
                         }
                     }
-
+                    
                     Spacer(modifier = Modifier.height(4.dp))
                 }
-
+                
                 // Message content
                 Text(
                     text = message.content,
@@ -1176,9 +1140,9 @@ private fun EnhancedMessageBubble(
                         MaterialTheme.colorScheme.onSurfaceVariant
                     }
                 )
-
+                
                 Spacer(modifier = Modifier.height(4.dp))
-
+                
                 // Timestamp
                 Text(
                     text = message.formattedTime,
@@ -1192,10 +1156,10 @@ private fun EnhancedMessageBubble(
                 )
             }
         }
-
+        
         if (isFromMe) {
             Spacer(modifier = Modifier.width(8.dp))
-
+            
             // My avatar for outgoing messages
             Box(
                 modifier = Modifier
@@ -1224,11 +1188,11 @@ private fun EnhancedUserNameDialog(
 ) {
     var name by remember { mutableStateOf("") }
     val focusRequester = remember { FocusRequester() }
-
+    
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
     }
-
+    
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -1253,7 +1217,7 @@ private fun EnhancedUserNameDialog(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-
+                
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
@@ -1265,17 +1229,17 @@ private fun EnhancedUserNameDialog(
                         .focusRequester(focusRequester),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(
-                        onDone = {
+                        onDone = { 
                             if (name.isNotBlank()) {
                                 onConfirm(name.trim())
                             }
                         }
                     )
                 )
-
+                
                 if (name.isBlank()) {
                     Button(
-                        onClick = {
+                        onClick = { 
                             name = generateRandomName()
                         },
                         modifier = Modifier.fillMaxWidth(),
@@ -1294,7 +1258,7 @@ private fun EnhancedUserNameDialog(
         },
         confirmButton = {
             Button(
-                onClick = {
+                onClick = { 
                     if (name.isNotBlank()) {
                         onConfirm(name.trim())
                     }
@@ -1354,7 +1318,7 @@ private fun EnhancedSettingsDialog(
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.Medium
                         )
-
+                        
                         listOf(
                             "👥 Connected Users: ${chatState.connectedUsers.size}",
                             "💬 Group Messages: ${chatState.messages.size}",
@@ -1370,7 +1334,7 @@ private fun EnhancedSettingsDialog(
                         }
                     }
                 }
-
+                
                 // Data management button
                 OutlinedButton(
                     onClick = onDataManagement,
@@ -1400,16 +1364,16 @@ private fun generateRandomName(): String {
         "Brave", "Clever", "Bold", "Mighty", "Super", "Epic", "Sharp", "Wise",
         "Zen", "Nova", "Stellar", "Cosmic", "Dynamic", "Rapid", "Elite", "Prime"
     )
-
+    
     val nouns = listOf(
         "Coder", "Hacker", "Ninja", "Wizard", "Master", "Guru", "Pro", "Expert",
         "Genius", "Legend", "Hero", "Champion", "Warrior", "Knight", "Captain",
         "Phoenix", "Dragon", "Tiger", "Eagle", "Wolf", "Lion", "Falcon", "Shark"
     )
-
+    
     val randomAdjective = adjectives.random()
     val randomNoun = nouns.random()
     val randomNumber = (10..99).random()
-
+    
     return "$randomAdjective$randomNoun$randomNumber"
 }

@@ -61,6 +61,9 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("androidx.datastore:datastore-preferences:1.0.0")
     
+    // Navigation
+    implementation("androidx.navigation:navigation-compose:2.7.6")
+    
     // Animation and UI improvements
     implementation("androidx.compose.animation:animation:1.7.5")
     implementation("androidx.compose.animation:animation-graphics:1.7.5")

@@ -57,6 +57,13 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
             
+        <!-- WiFi Discovery Service for background user detection -->
+        <service
+            android:name=".service.WiFiDiscoveryService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+            
         <!-- File Provider for chat data export -->
         <provider
             android:name="androidx.core.content.FileProvider"

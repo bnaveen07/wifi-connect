@@ -27,7 +27,8 @@ import com.bnaveen07.wificonnect.viewmodel.WiFiViewModel
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WiFiManagerScreen(
-    viewModel: WiFiViewModel = viewModel()
+    viewModel: WiFiViewModel = viewModel(),
+    onNavigateToChat: () -> Unit = {}
 ) {
     val connectionState by viewModel.connectionState.observeAsState()
     val isServiceRunning by viewModel.isServiceRunning.observeAsState(false)
@@ -53,9 +54,9 @@ fun WiFiManagerScreen(
             )
         }
         showLocalChat -> {
-            LocalChatScreen(
-                onBack = { showLocalChat = false }
-            )
+            // Navigate to chat list instead of showing inline
+            onNavigateToChat()
+            showLocalChat = false
         }
         else -> {
             // Main WiFi Manager Screen
@@ -133,6 +134,18 @@ private fun MainWiFiManagerContent(
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
                 )
             )
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = onShowLocalChat,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ) {
+                Icon(
+                    Icons.Default.Chat,
+                    contentDescription = "Start Local Chat"
+                )
+            }
         }
     ) { paddingValues ->
         Column(

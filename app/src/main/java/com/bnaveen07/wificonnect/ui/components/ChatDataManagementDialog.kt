@@ -13,7 +13,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.bnaveen07.wificonnect.data.ChatStatistics
+import com.bnaveen07.wificonnect.model.ChatStatistics
 import com.bnaveen07.wificonnect.viewmodel.ChatViewModel
 import android.content.Intent
 import android.net.Uri

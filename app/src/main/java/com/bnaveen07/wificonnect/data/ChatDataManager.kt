@@ -101,7 +101,7 @@ class ChatDataManager(private val context: Context) {
         return result
     }
     
-    // Store known users
+    // Save known users for quick access
     fun saveKnownUsers(users: List<ChatUser>) {
         val jsonArray = JSONArray()
         users.forEach { user ->
@@ -130,71 +130,20 @@ class ChatDataManager(private val context: Context) {
         return users
     }
     
-    // Store my name
+    // Save and load user name
     fun saveMyName(name: String) {
         sharedPreferences.edit()
             .putString(KEY_MY_NAME, name)
             .apply()
     }
     
-    // Load my name
     fun loadMyName(): String? {
         return sharedPreferences.getString(KEY_MY_NAME, null)
     }
     
-    // Get my name (with default empty string)
-    fun getMyName(): String {
-        return loadMyName() ?: ""
-    }
-    
-    // Store chat settings
-    fun saveChatSettings(encryptionEnabled: Boolean, autoSave: Boolean) {
-        val settings = JSONObject().apply {
-            put("encryptionEnabled", encryptionEnabled)
-            put("autoSave", autoSave)
-            put("lastUpdated", System.currentTimeMillis())
-        }
-        sharedPreferences.edit()
-            .putString(KEY_CHAT_SETTINGS, settings.toString())
-            .apply()
-    }
-    
-    // Load chat settings
-    fun loadChatSettings(): Pair<Boolean, Boolean> { // encryptionEnabled, autoSave
-        val jsonString = sharedPreferences.getString(KEY_CHAT_SETTINGS, null)
-        return if (jsonString != null) {
-            try {
-                val settings = JSONObject(jsonString)
-                Pair(
-                    settings.optBoolean("encryptionEnabled", true),
-                    settings.optBoolean("autoSave", true)
-                )
-            } catch (e: Exception) {
-                Pair(true, true) // Default values
-            }
-        } else {
-            Pair(true, true) // Default values
-        }
-    }
-    
     // Clear all chat data
     fun clearAllChatData() {
-        val editor = sharedPreferences.edit()
-        
-        // Clear group messages
-        editor.remove(KEY_GROUP_MESSAGES)
-        
-        // Clear all private messages
-        val allKeys = sharedPreferences.all.keys
-        allKeys.filter { it.startsWith(KEY_PRIVATE_MESSAGES) }.forEach { key ->
-            editor.remove(key)
-        }
-        
-        // Clear known users
-        editor.remove(KEY_KNOWN_USERS)
-        
-        // Keep my name and settings
-        editor.apply()
+        sharedPreferences.edit().clear().apply()
     }
     
     // Clear group messages only
@@ -221,23 +170,34 @@ class ChatDataManager(private val context: Context) {
         editor.apply()
     }
     
-    // Get chat statistics
-    fun getChatStatistics(): ChatStatistics {
+    // Get all messages (group and private)
+    fun getAllMessages(): Pair<List<ChatMessage>, Map<String, List<ChatMessage>>> {
         val groupMessages = loadGroupMessages()
         val privateMessages = loadAllPrivateMessages()
-        val totalPrivateMessages = privateMessages.values.sumOf { it.size }
-        val knownUsers = loadKnownUsers()
-        
-        return ChatStatistics(
-            totalGroupMessages = groupMessages.size,
-            totalPrivateMessages = totalPrivateMessages,
-            totalConversations = privateMessages.size,
-            knownUsersCount = knownUsers.size,
-            oldestMessageTime = (groupMessages + privateMessages.values.flatten())
-                .minOfOrNull { it.timestamp } ?: 0L,
-            newestMessageTime = (groupMessages + privateMessages.values.flatten())
-                .maxOfOrNull { it.timestamp } ?: 0L
-        )
+        return Pair(groupMessages, privateMessages)
+    }
+    
+    // Save discovered users
+    fun saveDiscoveredUsers(users: List<ChatUser>) {
+        saveKnownUsers(users)
+    }
+    
+    // Export chat data
+    fun exportChatData(groupMessages: List<ChatMessage>, privateMessages: Map<String, List<ChatMessage>>): String {
+        val exportData = JSONObject().apply {
+            put("exportTime", System.currentTimeMillis())
+            put("groupMessages", JSONArray().apply {
+                groupMessages.forEach { put(messageToJson(it)) }
+            })
+            put("privateMessages", JSONObject().apply {
+                privateMessages.forEach { (userIp, messages) ->
+                    put(userIp, JSONArray().apply {
+                        messages.forEach { put(messageToJson(it)) }
+                    })
+                }
+            })
+        }
+        return exportData.toString(2)
     }
     
     private fun messageToJson(message: ChatMessage): JSONObject {
@@ -253,17 +213,18 @@ class ChatDataManager(private val context: Context) {
             put("recipientName", message.recipientName)
             put("isEncrypted", message.isEncrypted)
             put("messageType", message.messageType.name)
+            put("isRead", message.isRead)
         }
     }
     
     private fun jsonToMessage(json: JSONObject): ChatMessage {
         return ChatMessage(
-            id = json.getString("id"),
-            content = json.getString("content"),
-            senderName = json.getString("senderName"),
-            senderIp = json.getString("senderIp"),
-            timestamp = json.getLong("timestamp"),
-            isFromMe = json.getBoolean("isFromMe"),
+            id = json.optString("id", ""),
+            content = json.optString("content", ""),
+            senderName = json.optString("senderName", ""),
+            senderIp = json.optString("senderIp", ""),
+            timestamp = json.optLong("timestamp", System.currentTimeMillis()),
+            isFromMe = json.optBoolean("isFromMe", false),
             isPrivate = json.optBoolean("isPrivate", false),
             recipientIp = json.optString("recipientIp", ""),
             recipientName = json.optString("recipientName", ""),
@@ -272,7 +233,8 @@ class ChatDataManager(private val context: Context) {
                 MessageType.valueOf(json.optString("messageType", "TEXT"))
             } catch (e: Exception) {
                 MessageType.TEXT
-            }
+            },
+            isRead = json.optBoolean("isRead", false)
         )
     }
     
@@ -281,8 +243,10 @@ class ChatDataManager(private val context: Context) {
             put("name", user.name)
             put("ipAddress", user.ipAddress)
             put("deviceName", user.deviceName)
-            put("publicKey", user.publicKey)
+            put("isOnline", user.isOnline)
             put("lastSeen", user.lastSeen)
+            put("publicKey", user.publicKey)
+            put("unreadCount", user.unreadCount)
         }
     }
     
@@ -291,22 +255,26 @@ class ChatDataManager(private val context: Context) {
             name = json.getString("name"),
             ipAddress = json.getString("ipAddress"),
             deviceName = json.getString("deviceName"),
-            publicKey = json.optString("publicKey", ""),
-            isOnline = false, // Will be updated by discovery
+            isOnline = json.optBoolean("isOnline", false),
             lastSeen = json.optLong("lastSeen", System.currentTimeMillis()),
-            unreadCount = 0 // Will be calculated during load
+            publicKey = json.optString("publicKey", ""),
+            unreadCount = json.optInt("unreadCount", 0)
         )
     }
-}
-
-data class ChatStatistics(
-    val totalGroupMessages: Int,
-    val totalPrivateMessages: Int,
-    val totalConversations: Int,
-    val knownUsersCount: Int,
-    val oldestMessageTime: Long,
-    val newestMessageTime: Long
-) {
-    val totalMessages: Int
-        get() = totalGroupMessages + totalPrivateMessages
+    
+    fun getChatStatistics(): com.bnaveen07.wificonnect.model.ChatStatistics {
+        val groupMessages = loadGroupMessages()
+        val privateMessages = loadAllPrivateMessages()
+        val totalPrivateMessages = privateMessages.values.sumOf { it.size }
+        val unreadMessages = privateMessages.values.sumOf { messages ->
+            messages.count { !it.isFromMe && !it.isRead }
+        }
+        
+        return com.bnaveen07.wificonnect.model.ChatStatistics(
+            totalUsers = loadKnownUsers().size,
+            totalGroupMessages = groupMessages.size,
+            totalPrivateMessages = totalPrivateMessages,
+            unreadMessages = unreadMessages
+        )
+    }
 }

@@ -13,7 +13,9 @@ data class ChatMessage(
     val recipientIp: String = "", // For private messages
     val recipientName: String = "", // For private messages
     val isEncrypted: Boolean = false,
-    val messageType: MessageType = MessageType.TEXT
+    val messageType: MessageType = MessageType.TEXT,
+    val isRead: Boolean = false, // For tracking read status
+    val deliveryStatus: DeliveryStatus = DeliveryStatus.SENT
 ) {
     val formattedTime: String
         get() {
@@ -22,7 +24,7 @@ data class ChatMessage(
             val minutes = date.minutes.toString().padStart(2, '0')
             return "$hours:$minutes"
         }
-    
+
     val displayContent: String
         get() = if (isEncrypted && !isFromMe) "🔒 Encrypted message" else content
 }
@@ -42,6 +44,7 @@ data class ChatUser(
 
 data class ChatState(
     val isEnabled: Boolean = false,
+    val isServiceRunning: Boolean = false,
     val myName: String = "",
     val myIpAddress: String = "",
     val connectedUsers: List<ChatUser> = emptyList(),
@@ -51,8 +54,27 @@ data class ChatState(
     val connectionStatus: ChatConnectionStatus = ChatConnectionStatus.DISCONNECTED,
     val currentChatMode: ChatMode = ChatMode.GROUP,
     val selectedUser: ChatUser? = null,
-    val encryptionEnabled: Boolean = true
-)
+    val encryptionEnabled: Boolean = true,
+    val autoSaveEnabled: Boolean = true,
+    val searchQuery: String = "",
+    val filteredUsers: List<ChatUser> = emptyList(),
+    val showOnlineOnly: Boolean = false,
+    val showAppUsersOnly: Boolean = false,
+    val lastScanTime: Long = 0L
+) {
+    val hasUsers: Boolean
+        get() = connectedUsers.isNotEmpty()
+        
+    val canSendMessages: Boolean
+        get() = isEnabled && connectionStatus == ChatConnectionStatus.CONNECTED
+        
+    val effectiveUserList: List<ChatUser>
+        get() = if (searchQuery.isNotEmpty() || showOnlineOnly || showAppUsersOnly) {
+            filteredUsers
+        } else {
+            connectedUsers
+        }
+}
 
 enum class ChatConnectionStatus {
     DISCONNECTED,
@@ -71,4 +93,62 @@ enum class MessageType {
     FILE,
     IMAGE,
     SYSTEM
+}
+
+enum class DeliveryStatus {
+    SENDING,
+    SENT,
+    DELIVERED,
+    READ,
+    FAILED
+}
+
+data class DeviceInfo(
+    val ipAddress: String = "",
+    val macAddress: String = "",
+    val deviceModel: String = "",
+    val androidVersion: String = "",
+    val appVersion: String = "",
+    val signalStrength: Int = 0,
+    val lastSeen: Long = System.currentTimeMillis(),
+    val isAppUser: Boolean = false,
+    val networkSSID: String = "",
+    val capabilities: List<String> = emptyList()
+)
+
+data class NetworkStats(
+    val totalUsers: Int = 0,
+    val appUsers: Int = 0,
+    val onlineUsers: Int = 0,
+    val offlineUsers: Int = 0,
+    val networkSSID: String = "",
+    val myIP: String = "",
+    val lastScanTime: Long = 0L
+)
+
+data class DiscoveryState(
+    val discoveredUsers: List<ChatUser> = emptyList(),
+    val isDiscovering: Boolean = false,
+    val lastScanTime: Long = 0L,
+    val networkSSID: String = "",
+    val totalUsers: Int = 0
+)
+
+data class ChatStatistics(
+    val totalUsers: Int = 0,
+    val totalGroupMessages: Int = 0,
+    val totalPrivateMessages: Int = 0,
+    val unreadMessages: Int = 0
+) {
+    val totalMessages: Int
+        get() = totalGroupMessages + totalPrivateMessages
+    
+    val knownUsersCount: Int
+        get() = totalUsers
+    
+    val totalConversations: Int
+        get() = totalUsers // Each user represents a potential conversation
+    
+    val newestMessageTime: Long = 0L
+    val oldestMessageTime: Long = 0L
 }
